@@ -1,0 +1,132 @@
+import mss
+import numpy as np
+import keyboard
+import time
+
+# ================== CALIBRATION ==================
+
+CAPTURE_REGION = {
+    "top": 592,
+    "left": 1057,
+    "width": 265,
+    "height": 107
+}
+
+PIPE_TOP_Y = 696
+
+# ================== CONTROL ======================
+
+LOWER_FLAP_Y = 3
+HITBOX_OFFSET = 2
+FLAP_COOLDOWN = 0.12
+ARM_Y_OFFSET = 20
+RISE_CONFIRM_PX = 8
+
+TARGET_DT = 0.008  # 125 FPS
+
+# ================== COLOR ========================
+
+RED_MIN = np.array([0, 0, 140])
+RED_MAX = np.array([90, 90, 255])
+
+# ================== STATE ========================
+
+sct = mss.mss()
+
+bot_enabled = False
+bot_armed = False
+
+prev_duck_y = None
+last_flap_time = 0
+waiting_for_arc = False
+last_flap_y = None
+
+first_pipe_passed = False
+
+# ================== HELPERS ======================
+
+def reset_controller():
+    global bot_armed, prev_duck_y, waiting_for_arc, last_flap_y, first_pipe_passed
+    bot_armed = False
+    prev_duck_y = None
+    waiting_for_arc = False
+    last_flap_y = None
+    first_pipe_passed = False
+    print("Controller reset")
+
+def toggle_bot():
+    global bot_enabled
+    bot_enabled = not bot_enabled
+    reset_controller()
+    print("BOT ARMED" if bot_enabled else "BOT DISABLED")
+
+keyboard.add_hotkey("space", reset_controller)
+keyboard.add_hotkey("F7", toggle_bot)
+
+print("F7 = Arm bot | SPACE = Start game | Q = Quit")
+
+# ================== MAIN LOOP ====================
+
+next_frame_time = time.perf_counter()
+
+while True:
+    frame = np.array(sct.grab(CAPTURE_REGION))[:, :, :3]
+    red_mask = np.all((frame >= RED_MIN) & (frame <= RED_MAX), axis=2)
+    duck_pixels = np.where(red_mask)
+
+    if duck_pixels[0].size > 0:
+        duck_local = duck_pixels[0].max()
+        duck_global = CAPTURE_REGION["top"] + duck_local + HITBOX_OFFSET
+
+        if prev_duck_y is None:
+            prev_duck_y = duck_global
+
+        vertical_speed = duck_global - prev_duck_y
+        prev_duck_y = duck_global
+
+        # -------- ARM --------
+        if bot_enabled and not bot_armed:
+            if duck_global < PIPE_TOP_Y - ARM_Y_OFFSET:
+                bot_armed = True
+                print("BOT ACTIVE")
+
+        # -------- FIRST PIPE PASS DETECTION --------
+        if not first_pipe_passed and duck_global >= PIPE_TOP_Y:
+            first_pipe_passed = True
+            print("First pipe cleared — full lock enabled")
+
+        # -------- ARC UNLOCK --------
+        if waiting_for_arc and last_flap_y is not None:
+            risen = last_flap_y - duck_global
+            if risen >= RISE_CONFIRM_PX and vertical_speed > 0:
+                waiting_for_arc = False
+
+        # -------- CONTROL --------
+        if bot_enabled and bot_armed and not waiting_for_arc:
+            distance = PIPE_TOP_Y - duck_global
+            now = time.perf_counter()
+
+            adaptive_margin = LOWER_FLAP_Y + (1 if vertical_speed > 2 else 0)
+
+            allow_below_lock = (
+                first_pipe_passed or duck_global >= PIPE_TOP_Y - 1
+            )
+
+            if (
+                allow_below_lock
+                and distance <= adaptive_margin
+                and vertical_speed > 0
+                and (now - last_flap_time) > FLAP_COOLDOWN
+            ):
+                keyboard.press_and_release("space")
+                last_flap_time = now
+                waiting_for_arc = True
+                last_flap_y = duck_global
+
+    next_frame_time += TARGET_DT
+    sleep_time = next_frame_time - time.perf_counter()
+    if sleep_time > 0:
+        time.sleep(sleep_time)
+
+    if keyboard.is_pressed("q"):
+        break
